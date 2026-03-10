@@ -1,0 +1,130 @@
+---
+description: API design and endpoint implementation guidelines
+globs: ["app/routers/**/*.py", "app/schemas/**/*.py"]
+alwaysApply: false
+---
+
+# API Design Guidelines
+
+## HTTP Method Semantics
+
+| Method   | Use case                                | Idempotent | Body |
+|----------|-----------------------------------------|-----------|------|
+| `GET`    | Retrieve resource(s)                    | Yes       | No   |
+| `POST`   | Create a new resource                   | No        | Yes  |
+| `PUT`    | Replace an entire resource              | Yes       | Yes  |
+| `PATCH`  | Partial update                          | No        | Yes  |
+| `DELETE` | Remove a resource                       | Yes       | No   |
+
+## HTTP Status Codes
+
+- **200** – Successful GET / PUT / PATCH
+- **201** – Resource created (POST)
+- **204** – No content (DELETE)
+- **400** – Bad request (business rule violation)
+- **401** – Missing or invalid authentication token
+- **403** – Authenticated but not authorized
+- **404** – Resource does not exist
+- **409** – Conflict (e.g. duplicate email)
+- **422** – Pydantic validation failed
+- **429** – Rate limit exceeded
+- **500** – Unexpected server error
+
+## Request Validation
+
+Always use Pydantic schemas for request bodies:
+
+```python
+class TaskCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=2000)
+    priority: Priority = Priority.MEDIUM
+    due_date: Optional[datetime] = None
+    assignee_id: Optional[UUID] = None
+    tag_ids: list[UUID] = Field(default_factory=list)
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+```
+
+## Error Response Format
+
+Every error response must conform to:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "TASK_NOT_FOUND",
+    "message": "Task with ID '3fa85f64' was not found.",
+    "details": {}
+  }
+}
+```
+
+Use a centralized exception handler registered in `main.py`:
+
+```python
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "error": exc.to_dict()},
+    )
+```
+
+## Pagination
+
+Use offset-based pagination for all list endpoints:
+
+```python
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: list[T]
+    total: int
+    page: int
+    page_size: int
+    has_next: bool
+    has_prev: bool
+```
+
+Default: `page=1`, `page_size=20`. Maximum `page_size`: 100.
+
+## Filtering and Sorting
+
+- Filters: `filter_status=open`, `filter_priority=high`
+- Sorting: `sort_by=created_at&sort_order=desc`
+- Text search: `q=keyword`
+
+## Authentication Flow
+
+```
+POST /auth/login   → { access_token, refresh_token }
+POST /auth/refresh → { access_token }
+POST /auth/logout  → 204
+```
+
+Access tokens expire in **24 hours**; refresh tokens in **30 days**.
+Include the token as: `Authorization: Bearer <token>`.
+
+## Rate Limiting
+
+Apply the `@rate_limit` decorator on individual routes when needed:
+
+```python
+@router.get("/tasks")
+@rate_limit(calls=100, period=60)
+async def list_tasks(
+    filters: TaskFilters = Depends(),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PaginatedResponse[TaskResponse]:
+    return await task_service.list_tasks(db, user, filters)
+```
+
+## Versioning
+
+All routes are prefixed with `/api/v1/`. When breaking changes are needed, add `/api/v2/` alongside the existing version; deprecate with a warning header:
+
+```
+Deprecation: true
+Sunset: Sat, 01 Jan 2028 00:00:00 GMT
+```
