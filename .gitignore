@@ -1,5 +1,6 @@
 # Environment variables (contains secrets!)
 .env
+.env.example
 
 # Python cache
 __pycache__/
