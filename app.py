@@ -40,9 +40,11 @@ from config import (
     COHERE_LLM_MODEL,
     CHROMA_PERSIST_DIR,
     CHROMA_COLLECTION_NAME,
+    EXTRACTED_DATA_PATH,
     TOP_K,
     SIMILARITY_CUTOFF,
 )
+from structured_store import StructuredStore
 from workflow import RAGWorkflow
 
 load_dotenv()
@@ -82,10 +84,23 @@ def _init_workflow() -> RAGWorkflow:
         llm=llm,
     )
 
+    structured_store = StructuredStore(EXTRACTED_DATA_PATH)
+    if structured_store.is_available:
+        summary = structured_store.summary()
+        logger.info(
+            "Structured store loaded: %s", summary["counts"]
+        )
+    else:
+        logger.warning(
+            "Structured store not found. Run 'python extract.py' to build it."
+        )
+
     return RAGWorkflow(
         retriever=retriever,
         postprocessor=postprocessor,
         response_synthesizer=response_synthesizer,
+        llm=llm,
+        structured_store=structured_store,
         timeout=60,
     )
 
@@ -114,22 +129,27 @@ with gr.Blocks(title="RAG – Agentic Coding Docs") as demo:
         # 🔍 RAG – מאגר ידע Agentic Coding
         שאל שאלות על כלי **Cursor** ו-**Claude Code** ועל הפרויקט Task Manager API.
 
-        המערכת מחפשת סמנטית בתיעוד, מאחזרת את הקטעים הרלוונטיים ביותר,
-        ומנסחת תשובה מפורטת בעזרת Cohere Command-R+.
+        המערכת מנתבת אוטומטית:
+        - **חיפוש סמנטי** – לשאלות הסבר, ארכיטקטורה, הגדרות ו-how-to.
+        - **שאילתה מובנית** – לשאלות רשימה מלאה, עדכניות, וסינון לפי זמן.
         """
     )
 
     gr.ChatInterface(
         fn=chat_fn,
         examples=[
+            # Semantic search examples
             "איך מתקינים את המערכת?",
             "מה הארכיטקטורה של הפרויקט?",
             "איך מריצים את הטסטים?",
             "מהי מדיניות האימות (Authentication) של ה-API?",
             "איך מגדירים משתני סביבה לפיתוח מקומי?",
-            "איך מוסיפים Migration חדש לבסיס הנתונים?",
-            "מה קורה כשמישהו שולח בקשה לא מאומתת?",
-            "איך מבצעים Deployment לפרודקשן?",
+            # Structured query examples
+            "תן לי רשימה של כל ההחלטות הטכניות שהתקבלו בפרויקט.",
+            "מה כל הכללים (rules) שחייבים לעקוב אחריהם?",
+            "אילו אזהרות קיימות במערכת – רשום את כולן.",
+            "מה כל התלויות החיצוניות של הפרויקט?",
+            "אילו שינויים (changes) תועדו בקוד?",
         ],
     )
 

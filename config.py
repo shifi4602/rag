@@ -23,6 +23,7 @@ CHROMA_COLLECTION_NAME: str = "agentic-tools-docs"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SAMPLE_PROJECT_DIR: Path = BASE_DIR / "sample_project"
+EXTRACTED_DATA_PATH: Path = BASE_DIR / "extracted_data.json"
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 TOP_K: int = 5               # number of nodes to retrieve
