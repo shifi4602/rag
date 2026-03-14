@@ -4,11 +4,14 @@ app.py – RAG Chat Application (Gradio)
 Exposes a chat interface where users can ask questions about the Agentic Coding
 tool documentation that was indexed by ingest.py.
 
-Query pipeline per user message:
-  1. Retrieve  – VectorRetriever fetches the top-K most similar nodes from ChromaDB
-  2. Postprocess – SimilarityPostprocessor filters out low-relevance nodes
-  3. Synthesize  – ResponseSynthesizer sends question + context to Cohere LLM
-  4. Return      – Answer + formatted source list displayed in the chat
+Query pipeline (event-driven – see workflow.py):
+  StartEvent → validate_input → retrieve → filter_results
+                                                ├── [above cutoff] → FilteredEvent
+                                                └── [below cutoff] → FallbackEvent → handle_fallback
+                                                                            ↓
+                                                                        synthesize (LLM)
+                                                                            ↓
+                                                                       format_response → StopEvent
 
 Run:
   python app.py
@@ -40,6 +43,7 @@ from config import (
     TOP_K,
     SIMILARITY_CUTOFF,
 )
+from workflow import RAGWorkflow
 
 load_dotenv()
 
@@ -49,119 +53,56 @@ logger = logging.getLogger(__name__)
 
 # ── Initialise RAG components (once at startup) ───────────────────────────────
 
-def _init_rag():
+def _init_workflow() -> RAGWorkflow:
     """
-    Build and return the three main RAG components:
-      - retriever         : finds relevant nodes in Pinecone
-      - postprocessor     : prunes low-similarity nodes
-      - response_synthesizer : generates the final answer via the LLM
+    Build all RAG components and wrap them in the event-driven RAGWorkflow.
     """
-    # Embedding model in query mode
     embed_model = CohereEmbedding(
         api_key=COHERE_API_KEY,
         model_name=COHERE_EMBED_MODEL,
         input_type="search_query",
     )
-
-    # LLM for answer synthesis
     llm = Cohere(
         api_key=COHERE_API_KEY,
         model=COHERE_LLM_MODEL,
     )
-
-    # Register globally so VectorStoreIndex and the synthesizer use them
     Settings.embed_model = embed_model
     Settings.llm = llm
 
-    # Load the existing ChromaDB collection (persisted by ingest.py)
     chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
     chroma_collection = chroma_client.get_collection(CHROMA_COLLECTION_NAME)
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
     index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
-    # Step 1 – Retriever
     retriever = index.as_retriever(similarity_top_k=TOP_K)
-
-    # Step 2 – Postprocessor
     postprocessor = SimilarityPostprocessor(similarity_cutoff=SIMILARITY_CUTOFF)
-
-    # Step 3 – Response Synthesizer
     response_synthesizer = get_response_synthesizer(
         response_mode=ResponseMode.COMPACT,
         llm=llm,
     )
 
-    return retriever, postprocessor, response_synthesizer
+    return RAGWorkflow(
+        retriever=retriever,
+        postprocessor=postprocessor,
+        response_synthesizer=response_synthesizer,
+        timeout=60,
+    )
 
 
-logger.info("Initialising RAG components …")
-retriever, postprocessor, response_synthesizer = _init_rag()
-logger.info("RAG components ready.")
-
-
-# ── Query pipeline ────────────────────────────────────────────────────────────
-
-def _format_sources(nodes: list) -> str:
-    """Build a compact, de-duplicated source list from retrieved nodes."""
-    seen: set[str] = set()
-    lines: list[str] = []
-
-    for node in nodes:
-        meta = node.metadata
-        tool = meta.get("tool", "Unknown")
-        title = meta.get("title") or meta.get("filename", "Unknown")
-        key = f"{tool}|{title}"
-
-        if key not in seen:
-            seen.add(key)
-            score = node.score
-            score_str = f" ({score:.2f})" if score is not None else ""
-            lines.append(f"• **{tool}** – {title}{score_str}")
-
-    return "\n".join(lines)
-
-
-def query_rag(question: str) -> tuple[str, str]:
-    """
-    Run the full RAG pipeline for a single question.
-    Returns (answer_text, sources_text).
-    """
-    logger.info("Query: %s", question)
-
-    # 1. Retrieve
-    nodes = retriever.retrieve(question)
-    logger.info("  Retrieved %d nodes", len(nodes))
-
-    # 2. Postprocess – filter by similarity score
-    filtered = postprocessor.postprocess_nodes(nodes, query_str=question)
-    logger.info("  After filtering: %d nodes", len(filtered))
-
-    # Graceful fallback: if nothing passes the cutoff, use top-3 anyway
-    if not filtered:
-        logger.warning("  All nodes below cutoff; falling back to top-3")
-        filtered = nodes[:3]
-
-    if not filtered:
-        return "לא נמצא מידע רלוונטי לשאלתך. נסה לנסח מחדש.", ""
-
-    # 3. Synthesize
-    response = response_synthesizer.synthesize(question, nodes=filtered)
-    answer = str(response)
-
-    sources = _format_sources(filtered)
-    return answer, sources
+logger.info("Initialising RAG workflow …")
+workflow = _init_workflow()
+logger.info("RAG workflow ready.")
 
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 
-def chat_fn(message: str, history: list) -> str:
+async def chat_fn(message: str, history: list) -> str:
     """
     Gradio chat callback.
-    Runs the RAG pipeline and appends the formatted sources to the answer.
+    Delegates to the event-driven RAGWorkflow and formats the output.
     """
-    answer, sources = query_rag(message)
+    answer, sources = await workflow.run(question=message)
     if sources:
         return f"{answer}\n\n---\n**מקורות:**\n{sources}"
     return answer

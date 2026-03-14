@@ -26,4 +26,4 @@ SAMPLE_PROJECT_DIR: Path = BASE_DIR / "sample_project"
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 TOP_K: int = 5               # number of nodes to retrieve
-SIMILARITY_CUTOFF: float = 0.40  # minimum similarity score to keep a node
+SIMILARITY_CUTOFF: float = 0.30  # minimum similarity score to keep a node

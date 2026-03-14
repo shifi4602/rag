@@ -1,11 +1,34 @@
 """
-ingest.py – RAG Data Ingestion Pipeline
-========================================
-Steps:
-  1. Load   – Read .md and .mdc files from sample_project/ with LlamaIndex SimpleDirectoryReader
-  2. Chunk  – Split each document into smaller nodes with MarkdownNodeParser
-  3. Embed  – Generate Cohere multilingual embeddings (embed-multilingual-v3.0)
-  4. Store  – Persist vectors + metadata in a local ChromaDB collection via VectorStoreIndex
+ingest.py – Event-Driven RAG Ingestion Workflow
+================================================
+
+Event Flow
+----------
+
+  IngestStartEvent (source_dir)
+        │
+        ▼
+  validate_source ──[dir missing / no .md files]──► IngestStopEvent (error)
+        │ SourceValidatedEvent
+        ▼
+  load_documents
+        │ DocumentsLoadedEvent
+        ▼
+  chunk_documents
+        │ NodesCreatedEvent
+        ▼
+  build_index
+        │ IngestStopEvent (stats)
+        ▼
+  (stats printed to log)
+
+Design notes
+------------
+- Steps 1–4 contain zero LLM calls; only Step 3 (build_index) calls Cohere
+  for embedding – this makes the LLM boundary explicit.
+- Events carry only the data produced at that step; nothing else is passed forward.
+- Adding a retry step or a different chunking strategy only requires adding a new
+  Event type and handler – existing steps are not touched.
 
 Run:
   python ingest.py
@@ -16,6 +39,7 @@ import truststore
 truststore.inject_into_ssl()
 
 import logging
+import asyncio
 from pathlib import Path
 
 import chromadb
@@ -23,6 +47,14 @@ from dotenv import load_dotenv
 
 from llama_index.core import SimpleDirectoryReader, StorageContext, VectorStoreIndex, Settings
 from llama_index.core.node_parser import MarkdownNodeParser
+from llama_index.core.workflow import (
+    Workflow,
+    step,
+    StartEvent,
+    StopEvent,
+    Event,
+)
+from llama_index.utils.workflow import draw_all_possible_flows
 from llama_index.embeddings.cohere import CohereEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
@@ -38,6 +70,28 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# ── Ingest Events ───────────────────────────────────────────────────────────
+
+# ── Ingest Events: StartEvent and StopEvent come from llama_index.core.workflow.
+# Custom events extend Event (a Pydantic BaseModel).
+
+
+class SourceValidatedEvent(Event):
+    """Source directory exists and contains at least one eligible file."""
+    source_dir: Path
+
+
+class DocumentsLoadedEvent(Event):
+    """Documents successfully loaded from disk."""
+    documents: list
+
+
+class NodesCreatedEvent(Event):
+    """Documents chunked into indexable nodes."""
+    documents: list
+    nodes: list
 
 
 # ── Metadata extraction ───────────────────────────────────────────────────────
@@ -76,108 +130,139 @@ def get_file_metadata(filepath: str) -> dict:
     }
 
 
-# ── Pipeline steps ────────────────────────────────────────────────────────────
+# ── Ingest Workflow ───────────────────────────────────────────────────────────
 
-def load_documents():
+
+class IngestWorkflow(Workflow):
     """
-    Step 1 – Loading
-    Use SimpleDirectoryReader to load all .md and .mdc files recursively.
-    Each document automatically receives the metadata from get_file_metadata.
+    Event-Driven ingestion pipeline built on the LlamaIndex Workflow pattern.
+
+    Each @step is an async handler.  LlamaIndex reads the type annotations to
+    route events automatically – no manual DISPATCH table needed.
+
+    Usage::
+
+        stats = await IngestWorkflow(timeout=300).run(source_dir=SAMPLE_PROJECT_DIR)
+
+    To draw a visual HTML graph of the workflow::
+
+        python ingest.py --draw   →  ingest_graph.html
     """
-    logger.info("Step 1 – Loading documents from: %s", SAMPLE_PROJECT_DIR)
 
-    reader = SimpleDirectoryReader(
-        input_dir=str(SAMPLE_PROJECT_DIR),
-        recursive=True,
-        required_exts=[".md", ".mdc"],
-        file_metadata=get_file_metadata,
-    )
-    documents = reader.load_data()
+    @step
+    async def validate_source(self, ev: StartEvent) -> SourceValidatedEvent | StopEvent:
+        """Step 1 – Source Validation: ensures the directory exists and has eligible files."""
+        source_dir = Path(ev.get("source_dir"))
 
-    logger.info("  Loaded %d documents", len(documents))
-    for doc in documents:
-        logger.info("    • [%s] %s", doc.metadata.get("tool", "?"), doc.metadata.get("filename", "?"))
+        if not source_dir.exists():
+            logger.error("[validate_source] Directory not found: %s", source_dir)
+            return StopEvent(result={"error": f"Directory not found: {source_dir}"})
 
-    return documents
+        eligible = list(source_dir.rglob("*.md")) + list(source_dir.rglob("*.mdc"))
+        if not eligible:
+            logger.error("[validate_source] No .md / .mdc files in: %s", source_dir)
+            return StopEvent(result={"error": f"No .md/.mdc files found in {source_dir}"})
 
+        logger.info("[validate_source] OK – %d eligible files", len(eligible))
+        return SourceValidatedEvent(source_dir=source_dir)
 
-def chunk_documents(documents):
-    """
-    Step 2 – Chunking
-    MarkdownNodeParser splits documents on markdown headings.
-    Each resulting node represents a logical section of the source file and
-    inherits the document's metadata (tool, filename, etc.).
-    """
-    logger.info("Step 2 – Chunking with MarkdownNodeParser …")
+    @step
+    async def load_documents(self, ev: SourceValidatedEvent) -> DocumentsLoadedEvent:
+        """Step 2 – Document Loading: reads all .md/.mdc files with full metadata."""
+        logger.info("[load_documents] Loading from: %s", ev.source_dir)
 
-    parser = MarkdownNodeParser()
-    nodes = parser.get_nodes_from_documents(documents, show_progress=True)
+        reader = SimpleDirectoryReader(
+            input_dir=str(ev.source_dir),
+            recursive=True,
+            required_exts=[".md", ".mdc"],
+            file_metadata=get_file_metadata,
+        )
+        documents = reader.load_data()
 
-    logger.info("  Created %d nodes from %d documents", len(nodes), len(documents))
-    return nodes
+        logger.info("[load_documents] %d documents loaded", len(documents))
+        for doc in documents:
+            logger.info(
+                "    • [%s] %s",
+                doc.metadata.get("tool", "?"),
+                doc.metadata.get("filename", "?"),
+            )
 
+        return DocumentsLoadedEvent(documents=documents)
 
-def build_vector_index(nodes):
-    """
-    Steps 3 & 4 – Embedding + VectorStoreIndex
-    Configure Cohere embeddings globally via Settings, then let VectorStoreIndex
-    embed every node and persist it (with metadata) in a local ChromaDB collection.
+    @step
+    async def chunk_documents(self, ev: DocumentsLoadedEvent) -> NodesCreatedEvent:
+        """Step 3 – Chunking: splits documents on Markdown headings."""
+        logger.info("[chunk_documents] Chunking with MarkdownNodeParser …")
 
-    The 'search_document' input_type instructs Cohere to optimise the embedding
-    for storage/retrieval rather than query matching.
-    """
-    logger.info("Step 3+4 – Embedding nodes and building VectorStoreIndex …")
+        parser = MarkdownNodeParser()
+        nodes = parser.get_nodes_from_documents(ev.documents, show_progress=True)
 
-    embed_model = CohereEmbedding(
-        api_key=COHERE_API_KEY,
-        model_name=COHERE_EMBED_MODEL,
-        input_type="search_document",
-    )
+        logger.info(
+            "[chunk_documents] %d nodes from %d documents",
+            len(nodes), len(ev.documents),
+        )
+        return NodesCreatedEvent(documents=ev.documents, nodes=nodes)
 
-    # Register the embed model globally so VectorStoreIndex picks it up
-    Settings.embed_model = embed_model
+    @step
+    async def build_index(self, ev: NodesCreatedEvent) -> StopEvent:
+        """Step 4 – Embedding + Index Storage  ← only step that calls Cohere."""
+        logger.info("[build_index] Embedding and storing %d nodes …", len(ev.nodes))
 
-    CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-    chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
-    # Delete existing collection so re-running ingest starts fresh
-    try:
-        chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
-    except Exception:
-        pass
-    chroma_collection = chroma_client.get_or_create_collection(CHROMA_COLLECTION_NAME)
+        embed_model = CohereEmbedding(
+            api_key=COHERE_API_KEY,
+            model_name=COHERE_EMBED_MODEL,
+            input_type="search_document",
+        )
+        Settings.embed_model = embed_model
 
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+        try:
+            chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
+        except Exception:
+            pass
+        chroma_collection = chroma_client.get_or_create_collection(CHROMA_COLLECTION_NAME)
 
-    index = VectorStoreIndex(
-        nodes,
-        storage_context=storage_context,
-        show_progress=True,
-    )
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    logger.info("  All nodes embedded and stored in ChromaDB at: %s", CHROMA_PERSIST_DIR)
-    return index
+        VectorStoreIndex(
+            ev.nodes,
+            storage_context=storage_context,
+            show_progress=True,
+        )
+
+        logger.info("[build_index] Stored in ChromaDB at: %s", CHROMA_PERSIST_DIR)
+        return StopEvent(result={
+            "documents": len(ev.documents),
+            "nodes": len(ev.nodes),
+            "collection": CHROMA_COLLECTION_NAME,
+            "persist_dir": str(CHROMA_PERSIST_DIR),
+        })
+
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+
+async def _run():
+    stats = await IngestWorkflow(timeout=300).run(source_dir=SAMPLE_PROJECT_DIR)
+    if "error" in stats:
+        logger.error("  Ingestion failed: %s", stats["error"])
+        return
+    logger.info("Ingestion complete! docs=%d nodes=%d", stats["documents"], stats["nodes"])
+
+
 def main():
-    logger.info("═══════════════════════════════════════")
-    logger.info("  RAG Ingestion Pipeline – START")
-    logger.info("═══════════════════════════════════════")
-
-    documents = load_documents()
-    nodes = chunk_documents(documents)
-    build_vector_index(nodes)
-
-    logger.info("═══════════════════════════════════════")
-    logger.info("  Ingestion complete!")
-    logger.info("  Documents  : %d", len(documents))
-    logger.info("  Chunks     : %d", len(nodes))
-    logger.info("  Collection : %s", CHROMA_COLLECTION_NAME)
-    logger.info("  Persisted  : %s", CHROMA_PERSIST_DIR)
-    logger.info("═══════════════════════════════════════")
+    logger.info("RAG Ingestion Workflow - START")
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--draw" in sys.argv:
+        out = Path(__file__).parent / "ingest_graph.html"
+        draw_all_possible_flows(IngestWorkflow(), filename=str(out))
+        print(f"Ingest graph saved -> {out}")
+    else:
+        main()
